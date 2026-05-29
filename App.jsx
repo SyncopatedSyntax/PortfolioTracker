@@ -167,22 +167,59 @@ export default function App() {
   const [fetSects,  setFetSects ] = useState(false);
   const [fLog,      setFLog     ] = useState('');
   const [clearConf, setClearConf] = useState(null);
+  const [debugLog,  setDebugLog  ] = useState([]);
+  const [testRun,   setTestRun   ] = useState(false);
   const fileRef = useRef(null);
+
+  const addLog = (msg, type = 'info') => {
+    const ts = new Date().toLocaleTimeString('en-CA', { hour12: false });
+    setDebugLog(prev => [...prev.slice(-99), { ts, type, msg: String(msg) }]);
+  };
 
   useEffect(() => {
     (async () => {
-      try { const r = await window.storage.get(LK); if (r) setLots(JSON.parse(r.value)); } catch (_) {}
-      try { const r = await window.storage.get(CK); if (r) setClosed(JSON.parse(r.value)); } catch (_) {}
-      try { const r = await window.storage.get(NK); if (r) setNotes(JSON.parse(r.value)); } catch (_) {}
-      try { const r = await window.storage.get(SK); if (r) setSnapshots(JSON.parse(r.value)); } catch (_) {}
+      const load = async (key, label, setter) => {
+        try {
+          const r = await window.storage.get(key);
+          if (r && r.value) {
+            const parsed = JSON.parse(r.value);
+            setter(parsed);
+            const count = Array.isArray(parsed) ? parsed.length : Object.keys(parsed).length;
+            addLog(`Loaded ${label}: ${count} record(s) from storage`, 'success');
+          } else {
+            addLog(`No data for ${label} (key: ${key})`, 'info');
+          }
+        } catch (e) {
+          addLog(`Load error [${label}]: ${e.message}`, 'error');
+        }
+      };
+      await load(LK, 'lots',      setLots);
+      await load(CK, 'closed',    setClosed);
+      await load(NK, 'notes',     setNotes);
+      await load(SK, 'snapshots', setSnapshots);
       setReady(true);
     })();
   }, []);
 
-  const saveLots      = async v => { setLots(v);      try { await window.storage.set(LK, JSON.stringify(v)); } catch (_) {} };
-  const saveClosed    = async v => { setClosed(v);    try { await window.storage.set(CK, JSON.stringify(v)); } catch (_) {} };
-  const saveNotes     = async v => { setNotes(v);     try { await window.storage.set(NK, JSON.stringify(v)); } catch (_) {} };
-  const saveSnapshots = async v => { setSnapshots(v); try { await window.storage.set(SK, JSON.stringify(v)); } catch (_) {} };
+  const storageSave = async (key, label, v) => {
+    try {
+      const serialized = JSON.stringify(v);
+      const result = await window.storage.set(key, serialized);
+      if (!result) {
+        addLog(`WARN: storage.set(${key}) returned falsy — data may not be persisted!`, 'warn');
+        return false;
+      }
+      return true;
+    } catch (e) {
+      addLog(`SAVE FAILED [${label}]: ${e.message}`, 'error');
+      return false;
+    }
+  };
+
+  const saveLots      = async v => { setLots(v);      await storageSave(LK, 'lots',      v); };
+  const saveClosed    = async v => { setClosed(v);    await storageSave(CK, 'closed',    v); };
+  const saveNotes     = async v => { setNotes(v);     await storageSave(NK, 'notes',     v); };
+  const saveSnapshots = async v => { setSnapshots(v); await storageSave(SK, 'snapshots', v); };
 
   const addSnapshot = async (lotsData) => {
     const val  = lotsData.reduce((s, l) => {
@@ -234,21 +271,39 @@ export default function App() {
     try {
       const raw = [...new Set(el.map(l => l.ticker))];
       const withEx = raw.map(t => { const lot = el.find(l => l.ticker === t); return `${normTick(t)} (${lot?.exchange || 'US'})`; });
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: `Get current market prices for: ${withEx.join(', ')}.\nReturn ONLY raw JSON: {"TICKER":price}. Normalized ticker as key (no exchange suffix). No markdown.` }] })
-      });
+      addLog(`Fetching prices for: ${raw.join(', ')}`, 'info');
+      let res;
+      try {
+        res = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: `Get current market prices for: ${withEx.join(', ')}.\nReturn ONLY raw JSON: {"TICKER":price}. Normalized ticker as key (no exchange suffix). No markdown.` }] })
+        });
+      } catch (fetchErr) {
+        addLog(`Network error (prices): ${fetchErr.constructor.name}: ${fetchErr.message}`, 'error');
+        throw fetchErr;
+      }
+      addLog(`API response status: ${res.status}`, res.ok ? 'info' : 'error');
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '(unreadable)');
+        addLog(`API error body: ${errBody.slice(0, 300)}`, 'error');
+        throw new Error(`HTTP ${res.status}`);
+      }
       const data = await res.json();
       const tb = data.content?.find(b => b.type === 'text');
       if (tb) {
-        const pm = JSON.parse(tb.text.replace(/```[\w]*/g, '').replace(/```/g, '').trim());
+        const raw2 = tb.text.replace(/```[\w]*/g, '').replace(/```/g, '').trim();
+        addLog(`API price response: ${raw2.slice(0, 200)}`, 'info');
+        const pm = JSON.parse(raw2);
         let upd = 0;
         const next = lots.map(l => { const n = normTick(l.ticker); const p = pm[n] ?? pm[n.toUpperCase()]; if (p != null) { upd++; return { ...l, currentPrice: p, lastUpdated: new Date().toISOString() }; } return l; });
         await saveLots(next);
         await addSnapshot(next);
         setFLog(`Updated ${upd}/${raw.length} prices — ${new Date().toLocaleTimeString()}`);
+        addLog(`Prices updated: ${upd}/${raw.length} tickers`, 'success');
+      } else {
+        addLog(`No text block in API response. Content: ${JSON.stringify(data.content).slice(0,200)}`, 'warn');
       }
-    } catch (e) { setFLog(`Error: ${e.message}`); }
+    } catch (e) { setFLog(`Error: ${e.message}`); addLog(`fetchPrices error: ${e.message}`, 'error'); }
     setFetching(false);
   };
 
@@ -258,19 +313,37 @@ export default function App() {
     setFetSects(true); setFLog('Fetching sectors...');
     try {
       const tickers = [...new Set(lots.map(l => normTick(l.ticker)))];
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: `For each of these stock/ETF tickers, identify its market sector.\nTickers: ${tickers.join(', ')}\nUse ONLY these sector values: Technology, Finance, Healthcare, Energy, Consumer, Real Estate, Utilities, Materials, Industrials, ETF / Index, Bonds, Other\nReturn ONLY raw JSON: {"TICKER":"Sector"}. No markdown, no explanation.` }] })
-      });
+      addLog(`Fetching sectors for: ${tickers.join(', ')}`, 'info');
+      let res;
+      try {
+        res = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: `For each of these stock/ETF tickers, identify its market sector.\nTickers: ${tickers.join(', ')}\nUse ONLY these sector values: Technology, Finance, Healthcare, Energy, Consumer, Real Estate, Utilities, Materials, Industrials, ETF / Index, Bonds, Other\nReturn ONLY raw JSON: {"TICKER":"Sector"}. No markdown, no explanation.` }] })
+        });
+      } catch (fetchErr) {
+        addLog(`Network error (sectors): ${fetchErr.constructor.name}: ${fetchErr.message}`, 'error');
+        throw fetchErr;
+      }
+      addLog(`Sectors API status: ${res.status}`, res.ok ? 'info' : 'error');
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '(unreadable)');
+        addLog(`Sectors API error: ${errBody.slice(0, 300)}`, 'error');
+        throw new Error(`HTTP ${res.status}`);
+      }
       const data = await res.json();
       const tb = data.content?.find(b => b.type === 'text');
       if (tb) {
-        const sm = JSON.parse(tb.text.replace(/```[\w]*/g, '').replace(/```/g, '').trim());
+        const raw = tb.text.replace(/```[\w]*/g, '').replace(/```/g, '').trim();
+        addLog(`Sectors response: ${raw.slice(0, 200)}`, 'info');
+        const sm = JSON.parse(raw);
         const next = lots.map(l => { const n = normTick(l.ticker); const s = sm[n] ?? sm[n.toUpperCase()]; return s ? { ...l, sector: s } : l; });
         await saveLots(next);
         setFLog(`Sectors updated — ${new Date().toLocaleTimeString()}`);
+        addLog(`Sectors updated for ${Object.keys(sm).length} tickers`, 'success');
+      } else {
+        addLog(`No text block in sectors response. Content: ${JSON.stringify(data.content).slice(0,200)}`, 'warn');
       }
-    } catch (e) { setFLog(`Sector error: ${e.message}`); }
+    } catch (e) { setFLog(`Sector error: ${e.message}`); addLog(`fetchSectors error: ${e.message}`, 'error'); }
     setFetSects(false);
   };
 
@@ -300,6 +373,88 @@ export default function App() {
   const submitNote = async () => {
     await saveNotes({ ...notes, [noteFor]: { thesis: nForm.thesis, notes: nForm.notes, targetPrice: parseFloat(nForm.targetPrice) || 0, stopLoss: parseFloat(nForm.stopLoss) || 0, dividendsReceived: parseFloat(nForm.dividendsReceived) || 0 } });
     setNoteFor(null);
+  };
+
+  // ── Debug functions ─────────────────────────────────────────────────────────
+  const runStorageTest = async () => {
+    setTestRun(true);
+    addLog('─── Storage diagnostic started ───', 'info');
+    const testKey = 'debug_test_' + Date.now();
+    const testVal = 'ping_' + Math.random().toString(36).slice(2);
+    // Write test
+    try {
+      const wr = await window.storage.set(testKey, testVal);
+      if (!wr) { addLog('WRITE: storage.set returned falsy (failure)', 'error'); }
+      else { addLog('WRITE: OK', 'success'); }
+    } catch (e) { addLog(`WRITE error: ${e.message}`, 'error'); }
+    // Read test
+    try {
+      const rr = await window.storage.get(testKey);
+      if (!rr)                    { addLog('READ: key not found after write!', 'error'); }
+      else if (rr.value !== testVal) { addLog(`READ MISMATCH: wrote "${testVal}", got "${rr.value}"`, 'error'); }
+      else                        { addLog('READ: OK — value matches', 'success'); }
+    } catch (e) { addLog(`READ error: ${e.message}`, 'error'); }
+    // Delete test
+    try { await window.storage.delete(testKey); addLog('DELETE: OK', 'success'); } catch (e) { addLog(`DELETE error: ${e.message}`, 'error'); }
+    // Check actual data keys
+    for (const [key, label] of [[LK,'lots'],[CK,'closed'],[NK,'notes'],[SK,'snapshots']]) {
+      try {
+        const r = await window.storage.get(key);
+        if (r && r.value) { addLog(`Key "${key}" (${label}): ${r.value.length} bytes found`, 'success'); }
+        else              { addLog(`Key "${key}" (${label}): NOT FOUND in storage`, 'warn'); }
+      } catch (e) { addLog(`Key "${key}" (${label}): ERROR — ${e.message}`, 'error'); }
+    }
+    addLog('─── Storage diagnostic done ───', 'info');
+    setTestRun(false);
+  };
+
+  const runAPITest = async () => {
+    setTestRun(true);
+    addLog('─── API connectivity test started ───', 'info');
+    addLog(`Fetching: https://api.anthropic.com/v1/messages`, 'info');
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 20, messages: [{ role: 'user', content: 'Reply with just the word OK.' }] })
+      });
+      addLog(`Response status: ${res.status} ${res.statusText}`, res.ok ? 'success' : 'error');
+      const body = await res.text();
+      addLog(`Response body (first 400 chars): ${body.slice(0, 400)}`, res.ok ? 'success' : 'error');
+      if (res.ok) {
+        try {
+          const j = JSON.parse(body);
+          addLog(`Parsed OK. Content: ${JSON.stringify(j.content)}`, 'success');
+        } catch(_) { addLog('Body is not valid JSON', 'warn'); }
+      }
+    } catch (e) {
+      addLog(`fetch() threw: ${e.constructor.name}: ${e.message}`, 'error');
+      if (e.cause) addLog(`Cause: ${JSON.stringify(e.cause)}`, 'error');
+    }
+    addLog('─── API test done ───', 'info');
+    setTestRun(false);
+  };
+
+  const copyDebug = () => {
+    const storeSizes = [
+      `${LK} (lots): ${JSON.stringify(lots).length} bytes, ${lots.length} records`,
+      `${CK} (closed): ${JSON.stringify(closed).length} bytes, ${closed.length} records`,
+      `${NK} (notes): ${JSON.stringify(notes).length} bytes, ${Object.keys(notes).length} tickers`,
+      `${SK} (snapshots): ${JSON.stringify(snapshots).length} bytes, ${snapshots.length} entries`,
+    ];
+    const lines = [
+      `=== Portfolio Tracker Debug Report ===`,
+      `Date: ${new Date().toISOString()}`,
+      `UserAgent: ${navigator.userAgent}`,
+      ``,
+      `=== Storage State ===`,
+      ...storeSizes,
+      ``,
+      `=== Event Log ===`,
+      ...debugLog.map(e => `[${e.ts}] [${e.type.toUpperCase()}] ${e.msg}`),
+    ];
+    navigator.clipboard.writeText(lines.join('\n')).catch(() => {});
+    addLog('Debug info copied to clipboard', 'success');
   };
 
   // ── Derived ───────────────────────────────────────────────────────────────
@@ -959,6 +1114,72 @@ export default function App() {
                 <div>Unique tickers: <span style={{ color: '#8cbf8c' }}>{new Set(lots.map(l => l.ticker)).size}</span></div>
                 <div>Institutions: <span style={{ color: '#8cbf8c' }}>{new Set(lots.map(l => l.bank)).size}</span></div>
                 <div>Snapshots stored: <span style={{ color: '#8cbf8c' }}>{snapshots.length}</span></div>
+              </div>
+            </div>
+
+            {/* DEBUG */}
+            <div className="card" style={{ borderColor: '#1e3a5c' }}>
+              <div className="section-title" style={{ color: '#5cd4c4', borderBottomColor: '#1e3a5c' }}>Debug Information</div>
+
+              <div className="setting-row">
+                <div>
+                  <div style={{ fontSize: 13, color: '#c8e6c8' }}>Storage Diagnostic</div>
+                  <div className="setting-desc">Write → Read → Delete a test key, then verify each data key exists in storage with its byte size.</div>
+                </div>
+                <button className="btn" style={{ flexShrink: 0, borderColor: '#5cd4c4', color: '#5cd4c4' }} onClick={runStorageTest} disabled={testRun}>
+                  {testRun ? 'Running...' : 'Run Storage Test'}
+                </button>
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <div style={{ fontSize: 13, color: '#c8e6c8' }}>API Connectivity Test</div>
+                  <div className="setting-desc">Makes a minimal call to the Anthropic API and logs the full response (status, headers, body). Use this to diagnose network errors.</div>
+                </div>
+                <button className="btn" style={{ flexShrink: 0, borderColor: '#5cd4c4', color: '#5cd4c4' }} onClick={runAPITest} disabled={testRun}>
+                  {testRun ? 'Running...' : 'Test API'}
+                </button>
+              </div>
+
+              <div style={{ marginTop: 16 }}>
+                <div style={{ fontSize: 11, color: '#4a7a4a', marginBottom: 8, letterSpacing: .5 }}>Storage State (in-memory)</div>
+                <div style={{ background: '#0a130a', border: '1px solid #1e3a5c', borderRadius: 4, padding: '10px 14px', fontSize: 12, fontFamily: "'DM Mono', monospace", color: '#8cbf8c', lineHeight: 2.1 }}>
+                  {[
+                    [`${LK}`, 'lots',      lots,      lots.length          + ' records'],
+                    [`${CK}`, 'closed',    closed,    closed.length        + ' records'],
+                    [`${NK}`, 'notes',     notes,     Object.keys(notes).length + ' tickers'],
+                    [`${SK}`, 'snapshots', snapshots, snapshots.length     + ' entries'],
+                  ].map(([key, label, data, count]) => (
+                    <div key={key}>
+                      <span style={{ color: '#5cd4c4' }}>{key}</span>
+                      <span style={{ color: '#2e5c2e' }}> → </span>
+                      <span style={{ color: '#c8e6c8' }}>{count}</span>
+                      <span style={{ color: '#2e5c2e' }}> · </span>
+                      <span style={{ color: '#4a7a4a' }}>{(JSON.stringify(data).length / 1024).toFixed(1)} KB</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginTop: 16 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <span style={{ fontSize: 11, color: '#4a7a4a', letterSpacing: .5 }}>Event Log — {debugLog.length} entries</span>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button className="btn-ghost" style={{ fontSize: 10, borderColor: '#1e3a5c', color: '#5cd4c4' }} onClick={() => setDebugLog([])}>Clear</button>
+                    <button className="btn-ghost" style={{ fontSize: 10, borderColor: '#1e3a5c', color: '#5cd4c4' }} onClick={copyDebug}>Copy All</button>
+                  </div>
+                </div>
+                <div style={{ background: '#0a130a', border: '1px solid #1e3a5c', borderRadius: 4, padding: '10px 14px', maxHeight: 300, overflowY: 'auto', fontSize: 11, fontFamily: "'DM Mono', monospace", lineHeight: 2 }}>
+                  {debugLog.length === 0
+                    ? <span style={{ color: '#2e5c2e' }}>No events yet — run a test or trigger an import / refresh.</span>
+                    : [...debugLog].reverse().map((e, i) => (
+                      <div key={i}>
+                        <span style={{ color: '#2e5c2e', marginRight: 8 }}>{e.ts}</span>
+                        <span style={{ marginRight: 8, color: e.type === 'error' ? '#ff7070' : e.type === 'success' ? '#5cff8c' : e.type === 'warn' ? '#ffd166' : '#4a7a4a' }}>[{e.type.toUpperCase()}]</span>
+                        <span style={{ color: e.type === 'error' ? '#ff9090' : e.type === 'success' ? '#a0e8b0' : e.type === 'warn' ? '#ffe599' : '#8cbf8c' }}>{e.msg}</span>
+                      </div>
+                    ))}
+                </div>
               </div>
             </div>
           </div>
